@@ -1,0 +1,1 @@
+CubeSat Telemetry Test: Batt=4.12V, Temp=25.4C
