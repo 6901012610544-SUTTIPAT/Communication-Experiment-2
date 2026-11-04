@@ -148,7 +148,7 @@ inline void sendKiss(Stream &out,
 }
 
 // CAP includes the KISS command byte.
-// RAW_CAP stores raw wire bytes (including FEND 0xC0 and escaped 0xDB sequences).
+// RAW_CAP stores raw wire bytes on GS without blocking smaller buffers on UNO.
 template <uint16_t CAP, uint16_t RAW_CAP = (CAP * 2 + 4)>
 class KissRx {
  public:
@@ -210,14 +210,12 @@ class KissRx {
 
     if (!active || bad) return false;
 
-    if (rawUsed == 0) {
+    // บันทึกเฉพาะกรณีที่บัฟเฟอร์ raw ยังว่าง โดยไม่ทำให้แพ็กเกจเสียหากเต็ม
+    if (rawUsed == 0 && RAW_CAP > 0) {
       raw[rawUsed++] = FEND;
     }
     if (rawUsed < RAW_CAP) {
       raw[rawUsed++] = value;
-    } else {
-      bad = true;
-      return false;
     }
 
     if (escaped) {
