@@ -107,7 +107,6 @@ inline bool readApp(const uint8_t *p, uint16_t n, App &a) {
     if (a.total == 0 || a.sequence >= a.total) return false;
     if (a.length == 0) return false;
 
-    // Every packet except the last must be full-sized.
     if (a.sequence + 1UL < a.total && a.length != CHUNK) {
       return false;
     }
@@ -149,17 +148,23 @@ inline void sendKiss(Stream &out,
 }
 
 // CAP includes the KISS command byte.
-// Returned data remains valid until the next feed() calls overwrite it.
-template <uint16_t CAP>
+// RAW_CAP stores raw wire bytes (including FEND 0xC0 and escaped 0xDB sequences).
+template <uint16_t CAP, uint16_t RAW_CAP = (CAP * 2 + 4)>
 class KissRx {
  public:
   uint8_t data[CAP];
   uint16_t length = 0;
+
+  uint8_t raw[RAW_CAP];
+  uint16_t rawLength = 0;
+
   uint32_t rejected = 0;
 
   void reset() {
     used = 0;
     length = 0;
+    rawUsed = 0;
+    rawLength = 0;
     active = false;
     escaped = false;
     bad = false;
@@ -184,8 +189,18 @@ class KissRx {
         ++rejected;
       }
 
+      if (ready) {
+        if (rawUsed < RAW_CAP) {
+          raw[rawUsed++] = FEND;
+        }
+        rawLength = rawUsed;
+      } else {
+        rawLength = 0;
+      }
+
       length = ready ? used : 0;
       used = 0;
+      rawUsed = 0;
       active = true;
       escaped = false;
       bad = false;
@@ -194,6 +209,16 @@ class KissRx {
     }
 
     if (!active || bad) return false;
+
+    if (rawUsed == 0) {
+      raw[rawUsed++] = FEND;
+    }
+    if (rawUsed < RAW_CAP) {
+      raw[rawUsed++] = value;
+    } else {
+      bad = true;
+      return false;
+    }
 
     if (escaped) {
       if (value == TFEND) {
@@ -222,6 +247,7 @@ class KissRx {
 
  private:
   uint16_t used = 0;
+  uint16_t rawUsed = 0;
   bool active = false;
   bool escaped = false;
   bool bad = false;
@@ -252,7 +278,6 @@ inline bool validAxHeader(const uint8_t *p) {
 }
 
 // Local ACK only: "AK" + application CRC32 + ACK CRC32.
-// This is not transmitted over RF.
 inline void makeAck(uint8_t *out, uint32_t token) {
   out[0] = 'A';
   out[1] = 'K';

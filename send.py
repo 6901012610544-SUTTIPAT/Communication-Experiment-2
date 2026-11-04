@@ -8,6 +8,12 @@ from pathlib import Path
 
 import serial
 
+from manual_codec import (
+    format_codec_proof,
+    manual_ax25_encode,
+    manual_kiss_decode,
+    manual_kiss_encode,
+)
 
 CHUNK = 128
 MAX_FILE_SIZE = 4 * 1024 * 1024
@@ -42,10 +48,8 @@ def make_packet(kind, transfer_id, sequence, total, payload=b""):
 
 
 def kiss_encode(packet):
-    raw = b"\x00" + packet
-    raw = raw.replace(b"\xDB", b"\xDB\xDD")
-    raw = raw.replace(b"\xC0", b"\xDB\xDC")
-    return b"\xC0" + raw + b"\xC0"
+    wire, _ = manual_kiss_encode(packet)
+    return wire
 
 
 def wait_local_ack(port, expected_token, timeout=6.0):
@@ -113,28 +117,23 @@ def send_packet(port, packet, retries=3):
         time.sleep(0.25)
 
     raise RuntimeError(
-        "No local ACK from COMM. Check UNO↔Mega wiring, "
+        "No local ACK from COMM. Check UNO<->Mega wiring, "
         "power, baud rate, and sketches."
     )
 
 
 def encoded_name(name):
-    # Remove path components; preserve a valid UTF-8 boundary.
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
-
     raw = name.encode("utf-8")
     raw = raw[:48].decode("utf-8", errors="ignore").encode("utf-8")
-
     return raw or b"payload.bin"
 
 
 def load_input(args):
     if args.file is not None:
         path = Path(args.file)
-
         with path.open("rb") as source:
             data = source.read(MAX_FILE_SIZE + 1)
-
         default_name = path.name
     else:
         data = args.text.encode("utf-8")
@@ -149,10 +148,10 @@ def load_input(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Send file/text through UNO -> COMM -> HC-12"
+        description="Send file/text through UNO -> COMM -> HC-12 with AX.25 & KISS Codec Proof"
     )
 
-    parser.add_argument("--port", required=True)
+    parser.add_argument("--port", help="COM port of Arduino UNO (omit if using --dry-run)")
 
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--file")
@@ -166,8 +165,21 @@ def main():
         dest="transfer_id",
     )
     parser.add_argument("--meta-every", type=int, default=32)
+    parser.add_argument(
+        "--show-all-packets",
+        action="store_true",
+        help="Show KISS & AX.25 hex proof for every DATA chunk on terminal",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run Manual Codec proof without opening Serial port",
+    )
 
     args = parser.parse_args()
+
+    if not args.dry_run and not args.port:
+        parser.error("--port is required unless --dry-run is specified")
 
     if args.passes < 1:
         parser.error("--passes must be >= 1")
@@ -213,7 +225,21 @@ def main():
     print(f"Chunks      : {total}")
     print(f"File CRC32  : {file_crc:08X}")
     print(f"Passes      : {args.passes}")
-    print("Local ACK does not confirm reception at GS.")
+    print()
+
+    # แสดงการพิสูจน์การเข้ารหัส Manual Codec ของ META และ DATA ก้อนแรก
+    print(format_codec_proof(meta_packet, label="META PACKET"))
+    if total > 0:
+        first_chunk = data[:CHUNK]
+        first_data_pkt = make_packet(DATA, transfer_id, 0, total, first_chunk)
+        print()
+        print(format_codec_proof(first_data_pkt, label="FIRST DATA PACKET (SEQ=0)"))
+
+    if args.dry_run:
+        print("\n[DRY-RUN COMPLETE] Manual codec proof verified without hardware.")
+        return
+
+    print("\nLocal ACK confirms UNO->Mega transfer; check GS for RF reception.")
 
     started = time.monotonic()
 
@@ -223,7 +249,6 @@ def main():
         timeout=0.1,
         write_timeout=3,
     ) as port:
-        # Opening USB serial commonly resets an Arduino.
         time.sleep(2.5)
         port.reset_input_buffer()
 
@@ -248,6 +273,14 @@ def main():
                     payload,
                 )
 
+                if args.show_all_packets and pass_number == 1:
+                    ax_frame = manual_ax25_encode(packet)
+                    rf_kiss, _ = manual_kiss_encode(ax_frame)
+                    print(f"\n[TX PROOF SEQ={sequence}]")
+                    print(f"  DATA HEX : {payload.hex().upper()}")
+                    print(f"  AX25 HEX : {ax_frame.hex().upper()}")
+                    print(f"  KISS RAW : {rf_kiss.hex().upper()}")
+
                 send_packet(port, packet)
 
                 percent = 100.0 * (sequence + 1) / total
@@ -268,7 +301,7 @@ def main():
     elapsed = time.monotonic() - started
 
     print(f"\nTransmission rounds finished in {elapsed:.1f} s.")
-    print("Check the GS terminal for COMPLETE + CRC32 OK.")
+    print(f"Expected File CRC32 at GS : {file_crc:08X}")
     print(
         "To resend the same transfer while GS remains running, "
         f"use --id 0x{transfer_id:08X} with exactly the same data/name."

@@ -21,6 +21,22 @@ void tab() {
   Serial.write('\t');
 }
 
+void outputProtocolProof(const uint8_t *kissRaw,
+                         uint16_t kissRawLen,
+                         const uint8_t *axFrame,
+                         uint16_t axFrameLen,
+                         const uint8_t *appPacket,
+                         uint16_t appPacketLen) {
+  Serial.print(F("FRAME"));
+  tab();
+  printHex(kissRaw, kissRawLen);
+  tab();
+  printHex(axFrame, axFrameLen);
+  tab();
+  printHex(appPacket, appPacketLen);
+  Serial.println();
+}
+
 void outputApplication(const App &app) {
   if (app.type == META) {
     Serial.print(F("META"));
@@ -72,6 +88,7 @@ void processRadioFrame() {
   }
 
   const uint8_t *axFrame = radioRx.data + 1;
+  uint16_t axFrameLength = radioRx.length - 1;
 
   if (!validAxHeader(axFrame)) {
     ++rejectedPackets;
@@ -79,7 +96,7 @@ void processRadioFrame() {
   }
 
   const uint8_t *application = axFrame + AX_SIZE;
-  uint16_t applicationLength = radioRx.length - 1 - AX_SIZE;
+  uint16_t applicationLength = axFrameLength - AX_SIZE;
 
   App app;
 
@@ -89,6 +106,17 @@ void processRadioFrame() {
   }
 
   ++acceptedPackets;
+
+  // ส่งข้อมูลพิสูจน์ KISS Raw, AX.25 Frame และ Application Packet ให้ Python บันทึกลง Log
+  outputProtocolProof(
+      radioRx.raw,
+      radioRx.rawLength,
+      axFrame,
+      axFrameLength,
+      application,
+      applicationLength
+  );
+
   outputApplication(app);
 }
 

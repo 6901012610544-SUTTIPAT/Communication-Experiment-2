@@ -3,25 +3,22 @@
 
 using namespace Link;
 
-//RX, TX
+// RX, TX เชื่อมกับ Serial2 ของ Arduino Mega ฝั่ง CubeSat (พร้อมเชื่อม GND ร่วมกัน)
 SoftwareSerial comm(10, 11);
 
-KissRx<APP_MAX + 1> usbRx;
-KissRx<11> ackRx;
+KissRx<APP_MAX + 1, 4> usbRx;
+KissRx<11, 4> ackRx;
 
 constexpr uint32_t LOCAL_ACK_TIMEOUT_MS = 4000UL;
 
 bool forwardToComm(const uint8_t *packet,
                    uint16_t length,
                    uint32_t token) {
-  // Remove stale local ACK bytes.
   while (comm.available()) {
     comm.read();
   }
 
   ackRx.reset();
-
-  // Avoid USB TX interrupts while SoftwareSerial is transmitting.
   Serial.flush();
 
   sendKiss(comm, packet, length);

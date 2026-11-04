@@ -10,10 +10,16 @@ from pathlib import Path
 
 import serial
 
+from manual_codec import (
+    manual_ax25_decode,
+    manual_ax25_encode,
+    manual_kiss_decode,
+    manual_kiss_encode,
+)
 
 CHUNK = 128
 MAX_FILE_SIZE = 4 * 1024 * 1024
-MAX_LINE = 1024
+MAX_LINE = 4096  # ขยายจาก 1024 เพื่อรองรับบรรทัด FRAME ที่มี KISS Raw + AX.25 Hex
 
 
 def timestamp():
@@ -55,11 +61,8 @@ def serial_lines(port):
 def safe_filename(name_bytes):
     text = name_bytes.decode("utf-8", errors="replace")
     text = text.replace("\\", "/").rsplit("/", 1)[-1]
-
-    #Keep output paths independent of names received over RF.
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", text)
     cleaned = cleaned.strip("._")[:80]
-
     return "payload_" + (cleaned or "file.bin")
 
 
@@ -68,8 +71,6 @@ def allocate_directory(root):
     day_directory = root / day
     day_directory.mkdir(parents=True, exist_ok=True)
 
-    #Directory name depends only on the daily counter.
-    #mkdir() reserves the counter without overwriting an old session.
     for number in range(1, 1_000_000):
         directory = day_directory / f"RX_{number:06d}"
 
@@ -113,8 +114,9 @@ def parse_meta(fields):
 
 
 class Transfer:
-    def __init__(self, root, metadata):
+    def __init__(self, root, metadata, expected_reference=None):
         self.metadata = metadata
+        self.expected_reference = expected_reference
 
         (
             self.id,
@@ -146,6 +148,7 @@ class Transfer:
         self.received = 0
         self.received_bytes = 0
         self.duplicates = 0
+        self.first_data_proof_printed = False
 
         self.done = False
         self.failed = False
@@ -180,6 +183,50 @@ class Transfer:
     def log(self, message):
         self.log_file.write(f"{timestamp()} {message}\n")
         self.log_file.flush()
+
+    def log_protocol_layers(self, packet_label, frame_proof, data_hex, data_summary):
+        """
+        บันทึก KISS_RAW, AX25, และ DATA ลงในไฟล์ .txt log อย่างชัดเจน
+        พร้อมพิสูจน์การถอดรหัสด้วย Manual Codec
+        """
+        if frame_proof is not None:
+            kiss_hex, ax25_hex, app_hex = frame_proof
+            try:
+                kiss_info = manual_kiss_decode(bytes.fromhex(kiss_hex))
+                ax25_info = manual_ax25_decode(bytes.fromhex(ax25_hex))
+                unesc_str = ",".join(kiss_info["unescape_log"]) or "none"
+                ax25_hdr_desc = (
+                    f"dest={ax25_info['dest']} "
+                    f"src={ax25_info['src']} "
+                    f"ctrl=0x{ax25_info['control']:02X} "
+                    f"pid=0x{ax25_info['pid']:02X} "
+                    f"valid={ax25_info['valid']}"
+                )
+            except ValueError as exc:
+                unesc_str = f"decode_err({exc})"
+                ax25_hdr_desc = "decode_err"
+
+            self.log(
+                f"KISS_RAW [{packet_label}] "
+                f"len={len(kiss_hex)//2} "
+                f"unescaped={unesc_str} "
+                f"hex={kiss_hex}"
+            )
+            self.log(
+                f"AX25     [{packet_label}] "
+                f"{ax25_hdr_desc} "
+                f"header_hex={ax25_hex[:32]} "
+                f"full_ax25_hex={ax25_hex}"
+            )
+        else:
+            self.log(f"KISS_RAW [{packet_label}] (no raw frame record from GS)")
+            self.log(f"AX25     [{packet_label}] (no AX.25 frame record from GS)")
+
+        self.log(
+            f"DATA     [{packet_label}] "
+            f"{data_summary} "
+            f"payload_hex={data_hex}"
+        )
 
     def touch(self):
         self.last_seen = time.monotonic()
@@ -218,7 +265,7 @@ class Transfer:
         print(f"[FAILED 0x{self.id:08X}] {reason}")
         print(f"[PARTIAL] {self.part_path}")
 
-    def accept_data(self, sequence, total, payload):
+    def accept_data(self, sequence, total, payload, frame_proof=None):
         if total != self.total:
             raise ValueError("DATA total differs from META")
 
@@ -232,6 +279,20 @@ class Transfer:
             raise ValueError("DATA length differs from file layout")
 
         self.touch()
+
+        if not self.first_data_proof_printed and frame_proof is not None:
+            self.first_data_proof_printed = True
+            kiss_hex, ax25_hex, _ = frame_proof
+            ax_info = manual_ax25_decode(bytes.fromhex(ax25_hex))
+            print(f"\n=== [GS PROTOCOL UNWRAP PROOF: DATA SEQ={sequence}] ===")
+            print(f"  1) KISS RAW  ({len(kiss_hex)//2}B): {kiss_hex}")
+            print(
+                f"  2) AX.25 HDR (16B): {ax25_hex[:32]} "
+                f"[Dest={ax_info['dest']}, Src={ax_info['src']}, "
+                f"Ctrl=0x{ax_info['control']:02X}, PID=0x{ax_info['pid']:02X}]"
+            )
+            print(f"  3) DATA HEX  ({len(payload)}B): {payload.hex().upper()}")
+            print("=======================================================")
 
         if self.done or self.failed:
             self.duplicates += 1
@@ -313,30 +374,45 @@ class Transfer:
         self.file.close()
         self.file = None
 
-        # Directory is unique to this receive session.
         self.part_path.replace(self.final_path)
 
         self.done = True
         elapsed = time.monotonic() - self.started
 
+        received_content = self.final_path.read_bytes()
+
         self.log(
             f"COMPLETE crc32={actual_crc:08X} "
+            f"expected_crc32={self.expected_crc:08X} "
+            f"crc_match=True "
             f"size={self.size} elapsed_seconds={elapsed:.3f} "
             f"file={self.final_path.name}"
         )
 
         print(
             f"[COMPLETE 0x{self.id:08X}] "
-            f"CRC32 OK={actual_crc:08X}, {self.size} bytes"
+            f"CRC32 MATCH OK (expected={self.expected_crc:08X}, actual={actual_crc:08X}), "
+            f"{self.size} bytes"
         )
         print(f"[FILE] {self.final_path}")
 
-        # Also make small UTF-8 telemetry readable in the text log.
-        # json.dumps prevents embedded newlines/control characters
-        # from changing the log structure.
+        # ตรวจสอบเทียบกับไฟล์/ข้อความต้นทางแบบ Byte-by-Byte (ถ้าผู้ใช้ระบุ --verify-file หรือ --verify-text)
+        if self.expected_reference is not None:
+            exact_match = received_content == self.expected_reference
+            ref_crc = zlib.crc32(self.expected_reference) & 0xFFFFFFFF
+            verify_msg = (
+                f"SOURCE_VERIFY exact_byte_match={exact_match} "
+                f"source_size={len(self.expected_reference)} "
+                f"received_size={len(received_content)} "
+                f"source_crc32={ref_crc:08X} "
+                f"received_crc32={actual_crc:08X}"
+            )
+            self.log(verify_msg)
+            print(f"[VERIFY] {verify_msg}")
+
         if self.size <= 65536:
             try:
-                text = self.final_path.read_bytes().decode("utf-8")
+                text = received_content.decode("utf-8")
             except UnicodeDecodeError:
                 pass
             else:
@@ -344,6 +420,7 @@ class Transfer:
                     "TEXT_UTF8 "
                     + json.dumps(text, ensure_ascii=False)
                 )
+                print(f"[TEXT PREVIEW] {text!r}")
 
     def close(self):
         if self.file is not None:
@@ -368,19 +445,38 @@ class Transfer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Receive decoded application records from GS Mega"
+        description="Receive decoded application records and KISS/AX.25 proof from GS Mega"
     )
 
     parser.add_argument("--port", required=True)
     parser.add_argument("--out", type=Path, default=Path("logs"))
     parser.add_argument("--idle", type=float, default=30.0)
 
+    verify_group = parser.add_mutually_exclusive_group()
+    verify_group.add_argument(
+        "--verify-file",
+        type=Path,
+        help="Optional original file path to verify byte-for-byte match against received data",
+    )
+    verify_group.add_argument(
+        "--verify-text",
+        type=str,
+        help="Optional original text string to verify byte-for-byte match against received data",
+    )
+
     args = parser.parse_args()
 
     if args.idle <= 0:
         parser.error("--idle must be > 0")
 
+    expected_reference = None
+    if args.verify_file is not None:
+        expected_reference = args.verify_file.read_bytes()
+    elif args.verify_text is not None:
+        expected_reference = args.verify_text.encode("utf-8")
+
     current = None
+    pending_frame_proof = None
 
     try:
         with serial.Serial(
@@ -389,7 +485,6 @@ def main():
             timeout=0.2,
             write_timeout=2,
         ) as port:
-            # Opening the port commonly resets the GS Arduino.
             time.sleep(2.5)
             port.reset_input_buffer()
 
@@ -417,6 +512,13 @@ def main():
                     line = raw.decode("ascii")
                     fields = line.split("\t")
                     kind = fields[0]
+
+                    if kind == "FRAME":
+                        if len(fields) != 4:
+                            raise ValueError("FRAME field count")
+                        # เก็บ (kiss_raw_hex, ax25_hex, app_hex) ไว้จับคู่กับ META/DATA/END ถัดไปทันที
+                        pending_frame_proof = (fields[1], fields[2], fields[3])
+                        continue
 
                     if kind == "STAT":
                         if len(fields) != 4:
@@ -450,7 +552,9 @@ def main():
                                 current.close()
                                 current = None
 
-                            current = Transfer(args.out, metadata)
+                            current = Transfer(
+                                args.out, metadata, expected_reference
+                            )
 
                         elif current.metadata != metadata:
                             raise ValueError(
@@ -458,7 +562,16 @@ def main():
                             )
 
                         current.touch()
-                        current.log("RX " + line)
+                        current.log_protocol_layers(
+                            packet_label="META",
+                            frame_proof=pending_frame_proof,
+                            data_hex=fields[6],
+                            data_summary=(
+                                f"id=0x{metadata[0]:08X} total={metadata[1]} "
+                                f"size={metadata[2]} crc32={metadata[3]:08X}"
+                            ),
+                        )
+                        pending_frame_proof = None
                         current.maybe_finish()
                         continue
 
@@ -480,10 +593,23 @@ def main():
                                 f"[ORPHAN] DATA id=0x{transfer_id:08X}; "
                                 "waiting for its META"
                             )
+                            pending_frame_proof = None
                             continue
 
-                        current.log("RX " + line)
-                        current.accept_data(sequence, total, payload)
+                        current.log_protocol_layers(
+                            packet_label=f"DATA seq={sequence}/{total}",
+                            frame_proof=pending_frame_proof,
+                            data_hex=fields[5],
+                            data_summary=(
+                                f"id=0x{transfer_id:08X} seq={sequence} "
+                                f"total={total} len={length}"
+                            ),
+                        )
+                        proof_to_pass = pending_frame_proof
+                        pending_frame_proof = None
+                        current.accept_data(
+                            sequence, total, payload, frame_proof=proof_to_pass
+                        )
                         continue
 
                     if kind == "END":
@@ -493,13 +619,20 @@ def main():
                         transfer_id, total = map(int, fields[1:])
 
                         if current is None or current.id != transfer_id:
+                            pending_frame_proof = None
                             continue
 
                         if total != current.total:
                             raise ValueError("END total differs from META")
 
                         current.touch()
-                        current.log("RX " + line)
+                        current.log_protocol_layers(
+                            packet_label="END",
+                            frame_proof=pending_frame_proof,
+                            data_hex="",
+                            data_summary=f"id=0x{transfer_id:08X} total={total}",
+                        )
+                        pending_frame_proof = None
                         current.maybe_finish()
                         current.report_missing("END_OF_PASS")
                         continue
@@ -507,7 +640,6 @@ def main():
                     print("[WARN] Unknown USB record:", repr(line))
 
                 except ValueError as exc:
-                    # UnicodeDecodeError is also a ValueError.
                     print(f"[WARN] Bad USB record: {exc}; raw={raw!r}")
 
                     if current is not None:

@@ -4,8 +4,6 @@ using namespace Link;
 
 KissRx<APP_MAX + 1> payloadRx;
 
-// Conservative initial spacing for bench testing.
-// Tune only after measuring loss and throughput.
 constexpr uint16_t RF_GAP_MS = 250;
 
 void setup() {
@@ -34,7 +32,6 @@ void loop() {
     App app;
 
     if (!readApp(packet, packetLength, app)) {
-      // No ACK: UNO/PC will time out and retry.
       continue;
     }
 
@@ -44,9 +41,6 @@ void loop() {
     memcpy(axFrame + AX_SIZE, packet, packetLength);
 
     sendKiss(Serial1, axFrame, AX_SIZE + packetLength);
-
-    // Wait until the UART has physically transmitted its queued bytes.
-    // This does NOT confirm RF delivery.
     Serial1.flush();
 
     delay(RF_GAP_MS);
